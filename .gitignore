@@ -5,3 +5,4 @@ include
 lib
 *.log
 *.com
+duo.conf
