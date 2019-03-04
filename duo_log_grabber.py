@@ -1,170 +1,233 @@
-'''
-Grabs the administration and authentication logs from the Duo Security
-API and sends CEF-compliant syslog messages.
-
-Error/Debug Logs:
-Setting the 'DEBUG' flag in the conf.ini file prints all the
-CEF messages to a file specified in 'DEBUG_FILE'. By default,
-this is written to 'debug.log'. All exceptions  are logged to
-'exceptions.log'.
-
-Logging format (CEF):
-This is the ArcSight log format and is comprised of a syslog prefix,
-a header, and an extension, as shown here:
-
-    Jan 18 11:07:53 host CEF:Version|Device Vendor|
-    Device Product|Device Version|Signature ID|Name|Severity|[Extension]
-
-    Sep 19 08:26:10 host CEF:0|Security|threatmanager|1.0|100|worm
-    successfully stopped|10|src=10.0.0.1 dst=2.1.2.2 spt=1232
-
-'''
+#!/usr/bin/python
+from __future__ import absolute_import
 from __future__ import print_function
-from datetime import datetime
-import calendar
-import ConfigParser
-import duo_client
-from loggerglue.emitter import UDPSyslogEmitter
+import six.moves.configparser
+import optparse
+import os
+import sys
+import time
+import json
 import socket
 
+import duo_client
 
-def print_cef(func):
-    '''
-    Decorator which wraps send_syslog() and prints all CEF
-    messages to the file specified in conf.ini.
-    '''
-    def wrapper(*args, **kwargs):
-        if DEBUG:
-            with open(DEBUG_FILE, 'a+') as debug_file:
-                print(*args, file=debug_file)
-            func(*args, **kwargs)
+# For proxy support
+from urllib.parse import urlparse
+
+
+class BaseLog(object):
+
+    def __init__(self, admin_api, path, logname, siem_server):
+        self.admin_api = admin_api
+        self.siem_server = siem_server
+        self.path = path
+        self.logname = logname
+
+        self.mintime = (int(time.time()) - 1000000)
+        self.events = []
+
+    def get_events(self):
+        raise NotImplementedError
+
+    def print_events(self):
+        raise NotImplementedError
+
+    def get_last_timestamp_path(self):
+        """
+        Returns the path to the file containing the timestamp of the last
+        event fetched.
+        """
+        filename = self.logname + "_last_timestamp_" + self.admin_api.host
+        path = os.path.join(self.path, filename)
+        return path
+
+    def get_mintime(self):
+        """
+            Updates self.mintime which is the minimum timestamp of
+            log events we want to fetch.
+            self.mintime is > all event timestamps we have already fetched.
+        """
+        try:
+            # Only fetch events that come after timestamp of last event
+            path = self.get_last_timestamp_path()
+            self.mintime = int(open(path).read().strip()) + 1
+        except IOError:
+            pass
+
+    def write_last_timestamp(self):
+        """
+            Store last_timestamp so that we don't fetch the same events again
+        """
+        if self.logname == 'authentication':
+            if not self.events['authlogs']:
+                # Do not update last_timestamp
+                return
         else:
-            func(*args, **kwargs)
-    return wrapper
+            if not self.events:
+                # Do not update last_timestamp
+                return
+
+        last_timestamp = 0
+
+        if self.logname == 'authentication':
+            for event in self.events['authlogs']:
+                last_timestamp = max(last_timestamp, event['timestamp'])
+        else:
+            for event in self.events:
+                last_timestamp = max(last_timestamp, event['timestamp'])
+
+        path = self.get_last_timestamp_path()
+        f = open(path, "w")
+        f.write(str(last_timestamp))
+        f.close()
+
+    def run(self):
+        """
+        Fetch new log events and print them.
+        """
+        self.events = []
+        self.get_mintime()
+        self.get_events()
+        self.print_events()
+        self.write_last_timestamp()
 
 
-@print_cef
-def send_syslog(cef):
-    '''
-    Sends syslog messages to the server specified in conf.ini.
-    '''
-    l.emit(cef)
+class AdministratorLog(BaseLog):
+    def __init__(self, admin_api, path, siem_server):
+        BaseLog.__init__(self, admin_api, path, "administrator", siem_server)
+
+    def get_events(self):
+        self.events = self.admin_api.get_administrator_log(
+            mintime=self.mintime,
+        )
+
+    def print_events(self):
+        """
+        Send logs to SIEM server
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            for event in self.events:
+                s.connect((self.siem_server['host'], int(self.siem_server['port'])))
+                s.sendall(json.dumps(event).encode('utf-8'))
+                s.close()
+        except Exception as e:
+            print(e)
+        finally:
+            s.close()
 
 
-def log_to_cef(eventtype, action, **kwargs):
-    '''
-    Args are formatted as a CEF-compliant message and then
-    passed to send_syslog().
-    '''
-    header = '|'.join([CEF_VERSION, VENDOR, PRODUCT, VERSION,
-                       eventtype, action, SEVERITY]) + '|'
-    extension = []
-    for key in kwargs:
-        extension.extend([key + kwargs[key]])
+class AuthenticationLog(BaseLog):
+    def __init__(self, admin_api, path, siem_server):
+        BaseLog.__init__(self, admin_api, path, "authentication", siem_server)
 
-    msg = header + ' '.join(extension)
-    cef = ' '.join([syslog_header, msg])
+    def get_events(self):
+        self.events = self.admin_api.get_authentication_log(
+            api_version=2,
+            mintime=(self.mintime * 1000),
+        )
 
-    send_syslog(cef)
+    def print_events(self):
+        """
+        Send logs to SIEM server
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            for event in self.events['authlogs']:
+                s.connect((self.siem_server['host'], int(self.siem_server['port'])))
+                s.sendall(json.dumps(event).encode('utf-8'))
+                s.close()
+        except Exception as e:
+            print(e)
+        finally:
+            s.close()
 
 
-def get_logs(proxy=None, proxy_port=None):
-    '''
-    Connects to the DuoSecurity API and grabs the admin
-    and auth logs, which are then parsed and passed to
-    log)to_cef().
-    '''
-    admin_api = duo_client.Admin(
-        ikey=INTEGRATION_KEY,
-        skey=SECRET_KEY,
-        host=API_HOST)
+class TelephonyLog(BaseLog):
+    def __init__(self, admin_api, path, siem_server):
+        BaseLog.__init__(self, admin_api, path, "telephony",siem_server)
 
-    if proxy and proxy_port:
-        admin_api.set_proxy(proxy, proxy_port)
+    def get_events(self):
+        self.events = self.admin_api.get_telephony_log(
+            mintime=self.mintime,
+        )
 
-    # Check to see if DELTA is 0. If so, retrieve all logs.
-    if mintime == utc_date:
-        admin_log = admin_api.get_administrator_log()
-        auth_log = admin_api.get_authentication_log()
+    def print_events(self):
+        """
+        Send logs to SIEM server
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            for event in self.events:
+                s.connect((self.siem_server['host'], int(self.siem_server['port'])))
+                s.sendall(json.dumps(event).encode('utf-8'))
+                s.close()
+        except Exception as e:
+            print(e)
+        finally:
+            s.close()
+
+
+
+def admin_api_from_config(config_path):
+    """
+    Return a duo_client.Admin object created using the parameters
+    stored in a config file.
+    """
+    config = six.moves.configparser.ConfigParser()
+    config.read(config_path)
+    config_d = dict(config.items('duo'))
+    ca_certs = config_d.get("ca_certs", None)
+    if ca_certs is None:
+        ca_certs = config_d.get("ca", None)
+
+    ret = duo_client.Admin(
+        ikey=config_d['ikey'],
+        skey=config_d['skey'],
+        host=config_d['host'],
+        ca_certs=ca_certs,
+    )
+
+    http_proxy = config_d.get("http_proxy", None)
+    if http_proxy is not None:
+        proxy_parsed = urlparse(http_proxy)
+        proxy_host = proxy_parsed.hostname
+        proxy_port = proxy_parsed.port
+        ret.set_proxy(host = proxy_host, port = proxy_port)
+
+    return ret
+
+
+def siem_from_config(config_path):
+    config = six.moves.configparser.ConfigParser()
+    config.read(config_path)
+    config_d = dict(config.items('siem'))
+
+    return config_d
+
+def main():
+    parser = optparse.OptionParser(usage="%prog [<config file path>]")
+    (options, args) = parser.parse_args(sys.argv[1:])
+
+    if len(sys.argv) == 1:
+        config_path = os.path.abspath(__file__)
+        config_path = os.path.dirname(config_path)
+        config_path = os.path.join(config_path, "duo.conf")
     else:
-        admin_log = admin_api.get_administrator_log(mintime=mintime)
-        auth_log = admin_api.get_authentication_log(mintime=mintime)
+        config_path = os.path.abspath(sys.argv[1])
 
-    for entry in admin_log:
-        # timestamp is converted to milliseconds for CEF
-        # repr is used to keep '\\' in the domain\username
-        extension = {
-            'duser=': repr(entry['username']).lstrip("u").strip("'"),
-            'rt=': str(entry['timestamp'] * 1000),
-            'description=': str(entry.get('description')),
-            'dhost=': entry['host'],
-        }
+    admin_api = admin_api_from_config(config_path)
+    siem_server = siem_from_config(config_path)
 
-        log_to_cef(entry['eventtype'], entry['action'], **extension)
+    # Use the directory of the config file to store the last event tstamps
+    path = os.path.dirname(config_path)
 
-    for entry in auth_log:
-        # timestamp is converted to milliseconds for CEF
-        # repr is used to keep '\\' in the domain\username
-        extension = {
-            'rt=': str(entry['timestamp'] * 1000),
-            'src=': entry['ip'],
-            'dhost=': entry['host'],
-            'duser=': repr(entry['username']).lstrip("u").strip("'"),
-            'outcome=': entry['result'],
-            'cs1Label=': 'new_enrollment',
-            'cs1=': str(entry['new_enrollment']),
-            'cs2Label=': 'factor',
-            'cs2=': entry['factor'],
-            'ca3Label=': 'integration',
-            'cs3=': entry['integration'],
-        }
+    while True:
+        for logclass in (AdministratorLog, AuthenticationLog, TelephonyLog):
+            log = logclass(admin_api, path,siem_server)
+            log.run()
+        time.sleep(60)
 
-        log_to_cef(entry['eventtype'], entry['eventtype'], **extension)
 
-if __name__ == "__main__":
-    try:
-        config = ConfigParser.ConfigParser()
-        config.read('conf.ini')
-
-        INTEGRATION_KEY = config.get('api', 'INTEGRATION_KEY')
-        SECRET_KEY = config.get('api', 'SECRET_KEY')
-        API_HOST = config.get('api', 'API_HOST')
-        DELTA = config.getint('api', 'DELTA')
-
-        PROXY_ENABLE = config.getboolean('proxy', 'PROXY_ENABLE')
-
-        if PROXY_ENABLE:
-            PROXY_SERVER = config.get('proxy', 'PROXY_SERVER')
-            PROXY_PORT = config.getint('proxy', 'PROXY_PORT')
-
-        VENDOR = config.get('cef', 'VENDOR')
-        PRODUCT = config.get('cef', 'PRODUCT')
-        VERSION = config.get('cef', 'VERSION')
-        SEVERITY = config.get('cef', 'SEVERITY')
-        CEF_VERSION = config.get('cef', 'CEF_VERSION')
-        HOSTNAME = socket.gethostname()
-
-        SYSLOG_SERVER = config.get('syslog', 'SYSLOG_SERVER')
-        SYSLOG_PORT = config.getint('syslog', 'SYSLOG_PORT')
-
-        DEBUG = config.getboolean('debug', 'DEBUG')
-        DEBUG_FILE = config.get('debug', 'DEBUG_FILE')
-
-        date = datetime.utcnow()
-        utc_date = calendar.timegm(date.utctimetuple())
-        mintime = utc_date - DELTA
-
-        syslog_date = datetime.now()
-        syslog_date_time = syslog_date.strftime("%b %d %H:%M:%S")
-        syslog_header = ' '.join([syslog_date_time, HOSTNAME])
-
-        l = UDPSyslogEmitter(address=(SYSLOG_SERVER, SYSLOG_PORT))
-
-        if PROXY_ENABLE:
-            get_logs(proxy=PROXY_SERVER, proxy_port=PROXY_PORT)
-        else:
-            get_logs()
-
-    except Exception, e:
-        with open('exceptions.log', 'a+') as exception_file:
-            print(datetime.utcnow(), e, file=exception_file)
+if __name__ == '__main__':
+    main()
