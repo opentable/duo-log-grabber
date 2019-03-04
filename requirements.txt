@@ -1,2 +1,0 @@
-git+git://github.com/duosecurity/duo_client_python.git
-loggerglue==1.0
