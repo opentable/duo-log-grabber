@@ -105,16 +105,14 @@ class AdministratorLog(BaseLog):
         """
         Send logs to SIEM server
         """
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             for event in self.events:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((self.siem_server['host'], int(self.siem_server['port'])))
                 s.sendall(json.dumps(event).encode('utf-8'))
                 s.close()
         except Exception as e:
             print(e)
-        finally:
-            s.close()
 
 
 class AuthenticationLog(BaseLog):
@@ -131,16 +129,14 @@ class AuthenticationLog(BaseLog):
         """
         Send logs to SIEM server
         """
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             for event in self.events['authlogs']:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((self.siem_server['host'], int(self.siem_server['port'])))
                 s.sendall(json.dumps(event).encode('utf-8'))
                 s.close()
         except Exception as e:
             print(e)
-        finally:
-            s.close()
 
 
 class TelephonyLog(BaseLog):
@@ -156,18 +152,14 @@ class TelephonyLog(BaseLog):
         """
         Send logs to SIEM server
         """
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             for event in self.events:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((self.siem_server['host'], int(self.siem_server['port'])))
                 s.sendall(json.dumps(event).encode('utf-8'))
                 s.close()
         except Exception as e:
             print(e)
-        finally:
-            s.close()
-
-
 
 def admin_api_from_config(config_path):
     """
@@ -205,6 +197,13 @@ def siem_from_config(config_path):
 
     return config_d
 
+def time_delay_from_config(config_path):
+    config = six.moves.configparser.ConfigParser()
+    config.read(config_path)
+    config_d = dict(config.items('main'))
+
+    return int(config_d['delay'])
+
 def main():
     parser = optparse.OptionParser(usage="%prog [<config file path>]")
     (options, args) = parser.parse_args(sys.argv[1:])
@@ -218,6 +217,7 @@ def main():
 
     admin_api = admin_api_from_config(config_path)
     siem_server = siem_from_config(config_path)
+    time_delay = time_delay_from_config(config_path)
 
     # Use the directory of the config file to store the last event tstamps
     path = os.path.dirname(config_path)
@@ -226,7 +226,7 @@ def main():
         for logclass in (AdministratorLog, AuthenticationLog, TelephonyLog):
             log = logclass(admin_api, path,siem_server)
             log.run()
-        time.sleep(60)
+        time.sleep(time_delay)
 
 
 if __name__ == '__main__':
