@@ -211,7 +211,7 @@ def main():
     if len(sys.argv) == 1:
         config_path = os.path.abspath(__file__)
         config_path = os.path.dirname(config_path)
-        config_path = os.path.join(config_path, "duo.conf")
+        config_path = os.path.join(config_path, "config/duo.conf")
     else:
         config_path = os.path.abspath(sys.argv[1])
 

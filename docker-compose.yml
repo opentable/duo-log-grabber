@@ -1,4 +1,4 @@
-version: '3'
+version: '2'
 services:
   duologger:
     image: docker.otenv.com/duo_logger:1.0
@@ -14,7 +14,7 @@ services:
       com.duo.logger.code.version: "v1.0"
       com.duo.logger.built: "Sun, 03 March 2019 00:00:00 -0000"
     volumes:
-      - ./:/usr/src/app
+      - ./:/usr/src/app/config
 volumes:
   data:
     driver: local
